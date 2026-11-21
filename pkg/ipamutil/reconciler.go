@@ -25,6 +25,8 @@ import (
 	ctrlhandler "sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	providerannotations "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/annotations"
 )
 
 const (
@@ -233,6 +235,14 @@ func (r *ClaimReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ct
 			}
 			address.Labels[clusterv1.ClusterNameLabel] = val
 		}
+
+		// Record the claim UID on the address. spec.claimRef only carries the name, and a
+		// same-named recreated claim has a different UID; the reclaimer uses this annotation
+		// as authoritative ownership evidence before deleting a residual address.
+		if address.Annotations == nil {
+			address.Annotations = make(map[string]string)
+		}
+		address.Annotations[providerannotations.ClaimUIDAnnotation] = string(claim.UID)
 
 		_ = controllerutil.AddFinalizer(&address, ProtectAddressFinalizer)
 

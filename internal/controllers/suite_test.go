@@ -34,10 +34,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/controller-runtime/pkg/envtest/komega"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	//+kubebuilder:scaffold:imports
 	v1alpha2 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/index"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/reclaimer"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 )
 
@@ -85,8 +87,12 @@ var _ = BeforeSuite(func() {
 
 	//+kubebuilder:scaffold:scheme
 
+	// Bind the metrics server to an ephemeral port. The default :8080 can already be taken
+	// by another envtest process when test suites run concurrently on a shared host, which
+	// would make the (otherwise unrelated) manager fail to start.
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme: scheme.Scheme,
+		Scheme:  scheme.Scheme,
+		Metrics: metricsserver.Options{BindAddress: ":0"},
 	})
 	Expect(err).ToNot(HaveOccurred())
 
@@ -103,31 +109,41 @@ var _ = BeforeSuite(func() {
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 
+	addressReclaimer := &reclaimer.Reclaimer{
+		// In envtest the manager cache is authoritative; use the same client for both views.
+		Client:       mgr.GetClient(),
+		DirectReader: mgr.GetClient(),
+	}
+
 	Expect(
 		(&InClusterIPPoolReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Reclaimer: addressReclaimer,
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 
 	Expect(
 		(&GlobalInClusterIPPoolReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Reclaimer: addressReclaimer,
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 
 	Expect(
 		(&InClusterPrefixPoolReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Reclaimer: addressReclaimer,
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 
 	Expect(
 		(&GlobalInClusterPrefixPoolReconciler{
-			Client: mgr.GetClient(),
-			Scheme: mgr.GetScheme(),
+			Client:    mgr.GetClient(),
+			Scheme:    mgr.GetScheme(),
+			Reclaimer: addressReclaimer,
 		}).SetupWithManager(ctx, mgr),
 	).To(Succeed())
 

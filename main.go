@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/controllers"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/index"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/reclaimer"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/webhooks"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/ipamutil"
 )
@@ -157,30 +158,38 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "IPAddressClaim")
 		os.Exit(1)
 	}
+	addressReclaimer := &reclaimer.Reclaimer{
+		Client:       mgr.GetClient(),
+		DirectReader: mgr.GetAPIReader(),
+	}
 	if err = (&controllers.InClusterIPPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reclaimer: addressReclaimer,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InClusterIPPoolReconciler")
 		os.Exit(1)
 	}
 	if err = (&controllers.GlobalInClusterIPPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reclaimer: addressReclaimer,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GlobalInClusterIPPoolReconciler")
 		os.Exit(1)
 	}
 	if err = (&controllers.InClusterPrefixPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reclaimer: addressReclaimer,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InClusterPrefixPoolReconciler")
 		os.Exit(1)
 	}
 	if err = (&controllers.GlobalInClusterPrefixPoolReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Reclaimer: addressReclaimer,
 	}).SetupWithManager(ctx, mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "GlobalInClusterPrefixPoolReconciler")
 		os.Exit(1)

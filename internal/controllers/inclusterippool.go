@@ -35,6 +35,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/reclaimer"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
 
@@ -50,6 +51,10 @@ const (
 type InClusterIPPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Reclaimer removes residual IPAddress objects whose claim no longer exists. It is
+	// optional; when nil, orphan reclamation is skipped.
+	Reclaimer *reclaimer.Reclaimer
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -85,6 +90,10 @@ func (r *InClusterIPPoolReconciler) ipAddressToInClusterIPPool(_ context.Context
 type GlobalInClusterIPPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Reclaimer removes residual IPAddress objects whose claim no longer exists. It is
+	// optional; when nil, orphan reclamation is skipped.
+	Reclaimer *reclaimer.Reclaimer
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -133,7 +142,7 @@ func (r *InClusterIPPoolReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 		return ctrl.Result{}, nil
 	}
-	return genericReconcile(ctx, r.Client, pool)
+	return genericReconcile(ctx, r.Client, pool, r.Reclaimer)
 }
 
 //+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=globalinclusterippools,verbs=get;list;watch;create;update;patch;delete
@@ -153,10 +162,10 @@ func (r *GlobalInClusterIPPoolReconciler) Reconcile(ctx context.Context, req ctr
 		}
 		return ctrl.Result{}, nil
 	}
-	return genericReconcile(ctx, r.Client, pool)
+	return genericReconcile(ctx, r.Client, pool, r.Reclaimer)
 }
 
-func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPool) (_ ctrl.Result, reterr error) {
+func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPool, r *reclaimer.Reclaimer) (_ ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	patchHelper, err := patch.NewHelper(pool, c)
@@ -176,22 +185,36 @@ func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.Gener
 		Name:     pool.GetName(),
 	}
 
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to list addresses")
-	}
-
-	inUseCount := len(addressesInUse)
-
 	if !controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer) {
 		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
 	}
 
-	if !pool.GetDeletionTimestamp().IsZero() {
-		if inUseCount == 0 {
+	poolDeleting := !pool.GetDeletionTimestamp().IsZero()
+
+	// Reclaim residual addresses before the deletion short-circuit below, otherwise a
+	// deleting pool with orphans could never drain. The reclaimer never mutates the pool;
+	// it returns the retained objects and the desired requeue. Both branches below re-list
+	// the addresses afterwards, so no list is needed here.
+	var reclaimOutcome reclaimer.Outcome
+	if r != nil {
+		var reclaimErr error
+		reclaimOutcome, reclaimErr = r.ReclaimOrphanedAddresses(ctx, pool.GetNamespace(), poolTypeRef, poolDeleting)
+		if reclaimErr != nil {
+			return ctrl.Result{}, errors.Wrap(reclaimErr, "failed to reclaim orphaned addresses")
+		}
+	}
+
+	if poolDeleting {
+		// Refresh the in-use count after deletions so the finalizer can be released as soon
+		// as the pool is empty, within the same reconcile.
+		addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to re-list addresses while pool is deleting")
+		}
+		if len(addressesInUse) == 0 {
 			controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
 		}
-		return ctrl.Result{}, nil
+		return reclaimOutcome.Result, nil
 	}
 
 	poolIPSet, err := poolutil.PoolSpecToIPSet(pool.PoolSpec())
@@ -211,6 +234,13 @@ func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.Gener
 		}
 	}
 
+	// Re-list after reclamation so capacity stats converge per batch rather than only
+	// after an entire sweep.
+	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to re-list addresses")
+	}
+	inUseCount := len(addressesInUse)
 	free := poolCount - inUseCount
 	outOfRangeIPSet, err := poolutil.AddressesOutOfRangeIPSet(addressesInUse, poolIPSet)
 	if err != nil {
@@ -223,8 +253,29 @@ func genericReconcile(ctx context.Context, c client.Client, pool pooltypes.Gener
 		Free:       free,
 		OutOfRange: poolutil.IPSetCount(outOfRangeIPSet),
 	}
+	pool.PoolStatus().OrphanedAddresses = orphanedStatusEntries(reclaimOutcome.Retained)
+	pool.PoolStatus().OrphanedAddressCount = reclaimOutcome.RetainedTotal
 
 	log.Info("Updating pool with usage info", "statusAddresses", pool.PoolStatus().Addresses)
 
-	return ctrl.Result{}, nil
+	return reclaimOutcome.Result, nil
+}
+
+// orphanedStatusEntries maps the reclaimer's internal retained-object representation onto
+// the v1alpha2 API status type.
+func orphanedStatusEntries(retained []reclaimer.OrphanedAddress) []v1alpha2.OrphanedIPAddress {
+	if len(retained) == 0 {
+		return nil
+	}
+	entries := make([]v1alpha2.OrphanedIPAddress, 0, len(retained))
+	for _, o := range retained {
+		entries = append(entries, v1alpha2.OrphanedIPAddress{
+			Name:      o.Name,
+			Namespace: o.Namespace,
+			Address:   o.Address,
+			Reason:    string(o.Reason),
+			Message:   o.Message,
+		})
+	}
+	return entries
 }

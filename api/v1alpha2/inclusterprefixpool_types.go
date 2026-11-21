@@ -54,6 +54,20 @@ type InClusterPrefixPoolStatus struct {
 	// keeping a consistent status contract across pool types.
 	// +optional
 	Addresses *InClusterPrefixPoolStatusAddresses `json:"ipAddresses,omitempty"`
+
+	// OrphanedAddresses lists IPAddress objects that were retained because their
+	// ownership (the referenced IPAddressClaim) could not be proven. They still count
+	// against the pool's used capacity. The list is truncated at 100 entries;
+	// OrphanedAddressCount always carries the full number.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	OrphanedAddresses []OrphanedIPAddress `json:"orphanedAddresses,omitempty"`
+
+	// OrphanedAddressCount is the total number of retained, ownership-unproven
+	// IPAddress objects, including entries not shown in the truncated OrphanedAddresses.
+	// +optional
+	OrphanedAddressCount int `json:"orphanedAddressCount,omitempty"`
 }
 
 // InClusterPrefixPoolStatusAddresses contains the count of total, free, and used prefixes in a pool.

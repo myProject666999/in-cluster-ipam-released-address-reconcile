@@ -66,6 +66,43 @@ type InClusterIPPoolStatus struct {
 	// Addresses reports the count of total, free, and used IPs in the pool.
 	// +optional
 	Addresses *InClusterIPPoolStatusIPAddresses `json:"ipAddresses,omitempty"`
+
+	// OrphanedAddresses lists IPAddress objects that were retained because their
+	// ownership (the referenced IPAddressClaim) could not be proven. They still count
+	// against the pool's used capacity. The list is truncated at 100 entries;
+	// OrphanedAddressCount always carries the full number.
+	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MaxItems=100
+	OrphanedAddresses []OrphanedIPAddress `json:"orphanedAddresses,omitempty"`
+
+	// OrphanedAddressCount is the total number of retained, ownership-unproven
+	// IPAddress objects, including entries not shown in the truncated OrphanedAddresses.
+	// +optional
+	OrphanedAddressCount int `json:"orphanedAddressCount,omitempty"`
+}
+
+// OrphanedIPAddress describes an IPAddress object that the released-address reclaimer
+// retained because it could not prove which IPAddressClaim it belongs to. The object is
+// never deleted while ownership is uncertain.
+type OrphanedIPAddress struct {
+	// Name of the retained IPAddress.
+	Name string `json:"name"`
+
+	// Namespace of the retained IPAddress. Empty for cluster-scoped pools.
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// Address is the IP (or prefix) carried by the retained object.
+	// +optional
+	Address string `json:"address,omitempty"`
+
+	// Reason is the machine-readable classification explaining why it was retained.
+	Reason string `json:"reason"`
+
+	// Message is a human-readable explanation of the retained state.
+	// +optional
+	Message string `json:"message,omitempty"`
 }
 
 // InClusterIPPoolStatusIPAddresses contains the count of total, free, and used IPs in a pool.

@@ -268,6 +268,49 @@ spec:
                 - total
                 - used
                 type: object
+              orphanedAddressCount:
+                description: |-
+                  OrphanedAddressCount is the total number of retained, ownership-unproven
+                  IPAddress objects, including entries not shown in the truncated OrphanedAddresses.
+                type: integer
+              orphanedAddresses:
+                description: |-
+                  OrphanedAddresses lists IPAddress objects that were retained because their
+                  ownership (the referenced IPAddressClaim) could not be proven. They still count
+                  against the pool's used capacity. The list is truncated at 100 entries;
+                  OrphanedAddressCount always carries the full number.
+                items:
+                  description: |-
+                    OrphanedIPAddress describes an IPAddress object that the released-address reclaimer
+                    retained because it could not prove which IPAddressClaim it belongs to. The object is
+                    never deleted while ownership is uncertain.
+                  properties:
+                    address:
+                      description: Address is the IP (or prefix) carried by the retained
+                        object.
+                      type: string
+                    message:
+                      description: Message is a human-readable explanation of the
+                        retained state.
+                      type: string
+                    name:
+                      description: Name of the retained IPAddress.
+                      type: string
+                    namespace:
+                      description: Namespace of the retained IPAddress. Empty for
+                        cluster-scoped pools.
+                      type: string
+                    reason:
+                      description: Reason is the machine-readable classification explaining
+                        why it was retained.
+                      type: string
+                  required:
+                  - name
+                  - reason
+                  type: object
+                maxItems: 100
+                type: array
+                x-kubernetes-list-type: atomic
             type: object
         type: object
     served: true

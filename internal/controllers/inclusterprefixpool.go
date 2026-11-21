@@ -34,6 +34,7 @@ import (
 
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/poolutil"
+	"sigs.k8s.io/cluster-api-ipam-provider-in-cluster/internal/reclaimer"
 	pooltypes "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/pkg/types"
 )
 
@@ -46,6 +47,10 @@ const (
 type InClusterPrefixPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Reclaimer removes residual IPAddress objects whose claim no longer exists. It is
+	// optional; when nil, orphan reclamation is skipped.
+	Reclaimer *reclaimer.Reclaimer
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -81,6 +86,10 @@ func (r *InClusterPrefixPoolReconciler) ipAddressToInClusterPrefixPool(_ context
 type GlobalInClusterPrefixPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// Reclaimer removes residual IPAddress objects whose claim no longer exists. It is
+	// optional; when nil, orphan reclamation is skipped.
+	Reclaimer *reclaimer.Reclaimer
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -129,7 +138,7 @@ func (r *InClusterPrefixPoolReconciler) Reconcile(ctx context.Context, req ctrl.
 		}
 		return ctrl.Result{}, nil
 	}
-	return genericPrefixReconcile(ctx, r.Client, pool)
+	return genericPrefixReconcile(ctx, r.Client, pool, r.Reclaimer)
 }
 
 //+kubebuilder:rbac:groups=ipam.cluster.x-k8s.io,resources=globalinclusterprefixpools,verbs=get;list;watch;create;update;patch;delete
@@ -149,10 +158,10 @@ func (r *GlobalInClusterPrefixPoolReconciler) Reconcile(ctx context.Context, req
 		}
 		return ctrl.Result{}, nil
 	}
-	return genericPrefixReconcile(ctx, r.Client, pool)
+	return genericPrefixReconcile(ctx, r.Client, pool, r.Reclaimer)
 }
 
-func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPrefixPool) (_ ctrl.Result, reterr error) {
+func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes.GenericInClusterPrefixPool, r *reclaimer.Reclaimer) (_ ctrl.Result, reterr error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	patchHelper, err := patch.NewHelper(pool, c)
@@ -172,22 +181,33 @@ func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes
 		Name:     pool.GetName(),
 	}
 
-	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
-	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "failed to list addresses")
-	}
-
-	inUseCount := len(addressesInUse)
-
 	if !controllerutil.ContainsFinalizer(pool, ProtectPoolFinalizer) {
 		controllerutil.AddFinalizer(pool, ProtectPoolFinalizer)
 	}
 
-	if !pool.GetDeletionTimestamp().IsZero() {
-		if inUseCount == 0 {
+	poolDeleting := !pool.GetDeletionTimestamp().IsZero()
+
+	// Reclaim residual addresses before the deletion short-circuit so a deleting pool can
+	// still drain. The reclaimer never mutates the pool. Both branches below re-list the
+	// addresses afterwards, so no list is needed here.
+	var reclaimOutcome reclaimer.Outcome
+	if r != nil {
+		var reclaimErr error
+		reclaimOutcome, reclaimErr = r.ReclaimOrphanedAddresses(ctx, pool.GetNamespace(), poolTypeRef, poolDeleting)
+		if reclaimErr != nil {
+			return ctrl.Result{}, errors.Wrap(reclaimErr, "failed to reclaim orphaned addresses")
+		}
+	}
+
+	if poolDeleting {
+		addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
+		if err != nil {
+			return ctrl.Result{}, errors.Wrap(err, "failed to re-list addresses while pool is deleting")
+		}
+		if len(addressesInUse) == 0 {
 			controllerutil.RemoveFinalizer(pool, ProtectPoolFinalizer)
 		}
-		return ctrl.Result{}, nil
+		return reclaimOutcome.Result, nil
 	}
 
 	config := poolutil.NewPrefixPoolConfig(pool.PoolSpec())
@@ -195,6 +215,13 @@ func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes
 	if err != nil {
 		return ctrl.Result{}, errors.Wrap(err, "failed to count allocatable prefixes")
 	}
+
+	// Re-list after reclamation so capacity stats converge per batch.
+	addressesInUse, err := poolutil.ListAddressesInUse(ctx, c, pool.GetNamespace(), poolTypeRef)
+	if err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "failed to re-list addresses")
+	}
+	inUseCount := len(addressesInUse)
 
 	outOfRange := 0
 	for _, inUse := range addressesInUse {
@@ -217,8 +244,29 @@ func genericPrefixReconcile(ctx context.Context, c client.Client, pool pooltypes
 		Free:       free,
 		OutOfRange: outOfRange,
 	}
+	pool.PoolStatus().OrphanedAddresses = prefixOrphanedStatusEntries(reclaimOutcome.Retained)
+	pool.PoolStatus().OrphanedAddressCount = reclaimOutcome.RetainedTotal
 
 	log.Info("Updating prefix pool with usage info", "statusAddresses", pool.PoolStatus().Addresses)
 
-	return ctrl.Result{}, nil
+	return reclaimOutcome.Result, nil
+}
+
+// prefixOrphanedStatusEntries maps the reclaimer's retained objects onto the v1alpha2 API
+// status type shared by IP and prefix pools.
+func prefixOrphanedStatusEntries(retained []reclaimer.OrphanedAddress) []v1alpha2.OrphanedIPAddress {
+	if len(retained) == 0 {
+		return nil
+	}
+	entries := make([]v1alpha2.OrphanedIPAddress, 0, len(retained))
+	for _, o := range retained {
+		entries = append(entries, v1alpha2.OrphanedIPAddress{
+			Name:      o.Name,
+			Namespace: o.Namespace,
+			Address:   o.Address,
+			Reason:    string(o.Reason),
+			Message:   o.Message,
+		})
+	}
+	return entries
 }
